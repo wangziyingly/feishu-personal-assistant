@@ -1,0 +1,38 @@
+# 飞书个人助手配置
+# 使用方法：复制本文件为 config.yaml，填入真实值
+
+feishu:
+  # 飞书开放平台 → 你的自建应用 → 凭证与基础信息
+  app_id: "cli_xxxxxxxxxxxx"
+  app_secret: "xxxxxxxxxxxxxxxxxxxxxxxx"
+
+llm:
+  # 任意 OpenAI 兼容接口。以下为 Kimi（Moonshot）示例：
+  base_url: "https://api.moonshot.cn/v1"
+  api_key: "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+  # 可选模型：kimi-k3（旗舰，推荐）/ kimi-k2.6 / moonshot-v1-8k 等
+  # DeepSeek 示例：base_url 改为 https://api.deepseek.com/v1，model 改为 deepseek-chat
+  model: "kimi-k3"
+  temperature: 0.3
+
+schedule:
+  morning_brief: "08:00"   # 每日待办早报时间
+  paper_digest: "08:30"    # 每日论文订阅推送时间
+
+paper:
+  digest_top_n: 3          # 每日论文订阅推送篇数
+  search_top_n: 5          # 文献搜索返回条数
+
+# 多维表格归档（可选）：把题库/错题本记录同步到你的飞书多维表格
+# 1. 在飞书新建一个多维表格（如「面试小助理」）
+# 2. 打开表格 → 右上角「分享」→ 添加协作者 → 把应用「小助理」加为可编辑
+# 3. 从表格 URL 复制 app_token：https://xxx.feishu.cn/base/XXXXXXXX 这串就是
+# bitable:
+#   app_token: "XXXXXXXXXXXXXXXX"
+
+# 知识库归档（可选）：面经真题按分类分文档写入知识库
+# 1. 在飞书「知识库」新建一个空间（如「全网真题面经库」）
+# 2. 空间内「分享」→ 把应用「小助理」加为可管理成员
+# 3. 从空间 URL 拿 node_token，调 wiki get_node API 解析出 space_id 填这里
+# wiki:
+#   space_id: "1234567890"

@@ -1,0 +1,8 @@
+lark-oapi>=1.4.0
+openai>=1.30.0
+APScheduler>=3.10,<4
+pypdf>=4.0,<6
+arxiv>=2.1
+requests>=2.31
+PyYAML>=6.0
+python-dateutil>=2.8
