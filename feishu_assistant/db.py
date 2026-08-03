@@ -83,6 +83,27 @@ CREATE TABLE IF NOT EXISTS kv_store (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS conversations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conv_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    conv_id    INTEGER NOT NULL,
+    role       TEXT NOT NULL,          -- user / assistant
+    content    TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS inbox_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL UNIQUE,   -- 飞书消息 id，兼作去重键
+    payload    TEXT NOT NULL,          -- JSON：user_id/chat_id/msg_type/content
+    status     TEXT NOT NULL DEFAULT 'pending',  -- pending / done / failed
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    received_at TEXT NOT NULL
+);
 """
 
 
@@ -326,6 +347,64 @@ class Database:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+    # ---------- 入站事件队列（持久化：重启/崩溃后重放） ----------
+    def inbox_enqueue(self, message_id, payload):
+        """落库即去重：重复 message_id 返回 False（飞书重投只处理一次）。"""
+        try:
+            self._execute(
+                "INSERT INTO inbox_events(message_id, payload, received_at) VALUES(?,?,?)",
+                (message_id, json.dumps(payload, ensure_ascii=False), now_str()),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def inbox_pending(self, max_attempts=3, max_age_hours=24):
+        return self._query(
+            "SELECT * FROM inbox_events WHERE status != 'done' AND attempts < ? "
+            "AND received_at >= datetime('now', 'localtime', ?)",
+            (max_attempts, "-%d hours" % max_age_hours),
+        )
+
+    def inbox_mark(self, event_id, status):
+        self._execute(
+            "UPDATE inbox_events SET status=?, attempts=attempts+1 WHERE id=?",
+            (status, event_id),
+        )
+
+    # ---------- 多对话（命名会话 + 历史持久化） ----------
+    def create_conversation(self, user_id, name):
+        cur = self._execute(
+            "INSERT INTO conversations(user_id, name, created_at) VALUES(?,?,?)",
+            (user_id, name, now_str()),
+        )
+        return cur.lastrowid
+
+    def list_conversations(self, user_id):
+        return self._query(
+            "SELECT c.*, (SELECT COUNT(*) FROM conv_messages m WHERE m.conv_id=c.id) AS msg_count "
+            "FROM conversations c WHERE c.user_id=? ORDER BY c.id",
+            (user_id,),
+        )
+
+    def delete_conversation(self, conv_id, user_id):
+        self._execute("DELETE FROM conv_messages WHERE conv_id=?", (conv_id,))
+        self._execute("DELETE FROM conversations WHERE id=? AND user_id=?", (conv_id, user_id))
+
+    def add_conv_message(self, conv_id, role, content):
+        self._execute(
+            "INSERT INTO conv_messages(conv_id, role, content, created_at) VALUES(?,?,?,?)",
+            (conv_id, role, content, now_str()),
+        )
+
+    def get_conv_messages(self, conv_id, limit):
+        """按时间正序返回最近 limit 条。"""
+        rows = self._query(
+            "SELECT role, content FROM conv_messages WHERE conv_id=? ORDER BY id DESC LIMIT ?",
+            (conv_id, limit),
+        )
+        return rows[::-1]
 
     def close(self):
         with self._lock:

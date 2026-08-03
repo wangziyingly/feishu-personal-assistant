@@ -23,19 +23,21 @@ def _parse_hhmm(s, default=(8, 0)):
 
 
 class AssistantScheduler:
-    def __init__(self, cfg, db, bot, llm):
+    def __init__(self, cfg, db, bot, llm, router=None):
         self.cfg = cfg
         self.db = db
         self.bot = bot
+        self.router = router  # 可选：日报推送后登记指代点/历史，供用户追问
         self.todo = TodoModule(cfg, db, llm)
         self.paper = PaperModule(cfg, db, llm)
         self._sched = BackgroundScheduler()
 
         # 每分钟检查到点待办
         self._sched.add_job(self._job_due_todos, "interval", minutes=1, id="due_todos")
-        # 每日早报
+        # 每日早报（misfire 宽限 8 小时：机器睡眠醒来后补发）
         h, m = _parse_hhmm(cfg.morning_brief)
-        self._sched.add_job(self._job_morning_brief, CronTrigger(hour=h, minute=m), id="morning_brief")
+        self._sched.add_job(self._job_morning_brief, CronTrigger(hour=h, minute=m),
+                            id="morning_brief", misfire_grace_time=8 * 3600, coalesce=True)
         # 每日论文订阅推送：每 15 分钟扫一次，按每个订阅自己的时间推送（防当日重复）
         self._sched.add_job(self._job_paper_digest, "interval", minutes=15, id="paper_digest")
 
@@ -74,14 +76,12 @@ class AssistantScheduler:
 
     # ---------- 论文订阅推送 ----------
     def _should_push(self, sub, now):
-        """到点且今日未推。订阅时间窗 15 分钟（配合轮询间隔）。"""
+        """当天未推且已过订阅时间即推——机器睡眠错过窗口后，醒来能补推。"""
         if sub["last_pushed"] == now.strftime("%Y-%m-%d"):
             return False
         hhmm = sub["digest_time"] or self.cfg.paper_digest
         h, m = _parse_hhmm(hhmm, default=(8, 30))
-        target = h * 60 + m
-        now_min = now.hour * 60 + now.minute
-        return target <= now_min < target + 15
+        return now.hour * 60 + now.minute >= h * 60 + m
 
     def _job_paper_digest(self):
         try:
@@ -94,9 +94,13 @@ class AssistantScheduler:
                     continue
                 try:
                     top_n = sub["top_n"] or self.cfg.paper_digest_top_n
-                    text = self.paper.daily_digest(sub["user_id"], sub["keywords"], top_n)
+                    text, papers = self.paper.daily_digest(sub["user_id"], sub["keywords"], top_n)
                     if text:
                         self.bot.push(chat_id, text)
+                        if self.router:
+                            self.router.note_digest_push(sub["user_id"], text, papers)
+                    # 空结果（当天无新论文）也标记，避免每 15 分钟白跑一轮；
+                    # 异常走 except 不标记，下轮会重试
                     self.db.mark_pushed(sub["user_id"], now.strftime("%Y-%m-%d"))
                 except Exception as e:
                     logger.error("推送论文日报失败(user=%s): %s", sub["user_id"], e)

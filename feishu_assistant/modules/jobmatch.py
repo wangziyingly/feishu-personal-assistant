@@ -80,10 +80,11 @@ CLINIC_PROMPT = """你是阅简历无数的资深 HR，以挑剔眼光审这份�
 
 
 class JobMatchModule:
-    def __init__(self, cfg, db, llm):
+    def __init__(self, cfg, db, llm, bot=None):
         self.cfg = cfg
         self.db = db
         self.llm = llm
+        self.bot = bot
 
     def handle_match(self, user_id, args, ctx):
         jd = (args.get("jd") or "").strip()
@@ -157,11 +158,21 @@ class JobMatchModule:
         resume, jd, err = self._check_prereq(ctx)
         if err:
             return err
-        reply = self.llm.chat([
-            {"role": "user", "content": TAILOR_PROMPT % (resume[:7000], jd[:4000])},
-        ])
+        from ..bot import make_stream
+        stream = make_stream(self.bot, ctx)
+        try:
+            reply = self.llm.chat([
+                {"role": "user", "content": TAILOR_PROMPT % (resume[:7000], jd[:4000])},
+            ], on_delta=stream.update if stream else None)
+        except Exception as e:
+            if stream:
+                stream.close("（生成中断：%s，请稍后再试）" % e)
+            raise
         reply += "\n\n（可继续说「项目部分再突出一下 xxx」让我迭代；说「新建对话」可清空重来）"
         self.db.add_interview_session(user_id, "prep_resume", {"jd": jd[:1000]}, reply)
+        if stream:
+            stream.close(reply)
+            return None
         return reply
 
     def write_letter(self, user_id, args, ctx):

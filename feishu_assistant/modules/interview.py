@@ -47,11 +47,12 @@ EXTRACT_FAIL_PROMPT = """以下是一场模拟面试的记录。找出候选人�
 
 
 class InterviewModule:
-    def __init__(self, cfg, db, llm, bitable=None):
+    def __init__(self, cfg, db, llm, bitable=None, bot=None):
         self.cfg = cfg
         self.db = db
         self.llm = llm
         self.bitable = bitable
+        self.bot = bot
 
     # ---------- 模拟面试 ----------
     def start_mock(self, user_id, args, ctx):
@@ -177,16 +178,27 @@ class InterviewModule:
         if len(resume_text) < 50:
             return "简历内容太短了。可以把简历文字粘贴给我，或直接发 PDF 文件。"
         ctx["last_resume_text"] = resume_text[:8000]
-        result = self.llm.chat([
-            {"role": "system", "content":
-                "你是资深面试官。针对候选人简历做深挖式提问，要求：\n"
-                "1. 按项目/经历分组，每组 2-4 个追问，问细节、问权衡、问结果数据；\n"
-                "2. 标出你认为简历中表述模糊、面试时容易被挑战的点；\n"
-                "3. 用中文，问题要具体，不要泛泛的「介绍一下你的项目」。"},
-            {"role": "user", "content": "简历内容：\n" + resume_text[:8000]},
-        ])
+        from ..bot import make_stream
+        stream = make_stream(self.bot, ctx)
+        try:
+            result = self.llm.chat([
+                {"role": "system", "content":
+                    "你是资深面试官。针对候选人简历做深挖式提问，要求：\n"
+                    "1. 按项目/经历分组，每组 2-4 个追问，问细节、问权衡、问结果数据；\n"
+                    "2. 标出你认为简历中表述模糊、面试时容易被挑战的点；\n"
+                    "3. 用中文，问题要具体，不要泛泛的「介绍一下你的项目」。"},
+                {"role": "user", "content": "简历内容：\n" + resume_text[:8000]},
+            ], on_delta=stream.update if stream else None)
+        except Exception as e:
+            if stream:
+                stream.close("（生成中断：%s，请稍后再试）" % e)
+            raise
         self.db.add_interview_session(user_id, "resume", {"resume": resume_text[:2000]}, result)
-        return result + "\n\n回复「用这份简历模拟面试」，我可以直接扮演面试官开始实战演练。"
+        reply = result + "\n\n回复「用这份简历模拟面试」，我可以直接扮演面试官开始实战演练。"
+        if stream:
+            stream.close(reply)
+            return None
+        return reply
 
     # ---------- 复盘错题本 ----------
     def handle_review(self, user_id, args, raw_text):

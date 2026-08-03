@@ -26,11 +26,12 @@ class LLMClient:
             max_retries=0,
         )
 
-    def chat(self, messages, temperature=None, max_tokens=None):
+    def chat(self, messages, temperature=None, max_tokens=None, on_delta=None):
         """普通对话，返回文本。失败抛 LLMError。
 
         流式读取：kimi-k3 这类推理模型长生成（简历分析/文献汇报）可能远超 2 分钟，
         非流式的总超时必然误杀；流式下超时按分片到达间隔计，不受总时长限制。
+        on_delta：可选回调，收到每个分片时以"当前累计全文"调用（供流式回复刷新）。
         """
         kwargs = dict(
             model=self.cfg.llm_model,
@@ -50,6 +51,11 @@ class LLMClient:
                     piece = getattr(chunk.choices[0].delta, "content", None)
                     if piece:
                         parts.append(piece)
+                        if on_delta:
+                            try:
+                                on_delta("".join(parts))
+                            except Exception:
+                                pass
                 return "".join(parts).strip()
             except Exception as e:  # openai 各类异常统一兜底
                 last_err = e

@@ -6,6 +6,7 @@
 - sessions：阻塞式多轮会话（模拟面试/题库考试），进行中时用户消息直接续聊，不再走意图分类
 - contexts：被动上下文（最近待办列表/搜索结果/刚上传的PDF/简历/JD），供「第2条」「第1篇」这类指代解析
 """
+import logging
 import threading
 from datetime import datetime
 
@@ -24,6 +25,14 @@ HISTORY_MAX_PAIRS = 10     # 滚动历史保留轮数（超出丢弃最旧的）
 HISTORY_MSG_CHARS = 500    # 每条消息存入历史的截断长度（控制 token）
 CLASSIFY_HISTORY = 6       # 意图分类时带入的最近消息条数（3 轮）
 
+logger = logging.getLogger(__name__)
+
+
+def _brief(text, n=60):
+    """单行截断，用于日志。"""
+    s = " ".join(str(text or "").split())
+    return s[:n] + ("…" if len(s) > n else "")
+
 INTENT_PROMPT = """你是飞书个人助手的意图分类器。当前时间：{now}（{weekday}）。
 把用户消息分类为以下意图之一，并抽取参数，输出 JSON：{{"intent": "...", "args": {{...}}}}
 
@@ -36,8 +45,8 @@ INTENT_PROMPT = """你是飞书个人助手的意图分类器。当前时间：{
 3. paper_search —— 搜索文献（支持描述研究需求）。args: {{"query":"用户的需求原文或关键词"}}
    例：「帮我搜一下 RAG 最新的论文」→ {{"intent":"paper_search","args":{{"query":"RAG 最新论文"}}}}
    例：「我在做多智能体系统的信用分配，帮我找相关最新方法」→ {{"intent":"paper_search","args":{{"query":"多智能体系统的信用分配 最新方法"}}}}
-4. paper_summarize_index —— 快速总结上次搜索结果中的第 N 篇（摘要级解读）。args: {{"index":1}}
-   例：「总结第1篇」
+4. paper_summarize_index —— 快速总结上次搜索/日报中的第 N 篇（摘要级解读）。args: {{"index":1}}
+   例：「总结第1篇」「我对第1篇比较感兴趣」「第一篇挺有意思」→ index=1
 5. paper_report —— 对论文做深度文献汇报/精读（组会汇报级）。args: {{"index": 序号或null, "title": "论文标题或null"}}
    例：「汇报第1篇」「精读第2篇」→ index 为序号；「生成文献汇报」「汇报这篇」（针对刚上传的 PDF）→ index=null；
    「汇报 Reflexion 这篇」「就刚才说的那篇 XX」→ {{"intent":"paper_report","args":{{"index":null,"title":"Reflexion"}}}}
@@ -81,7 +90,10 @@ INTENT_PROMPT = """你是飞书个人助手的意图分类器。当前时间：{
     例：「简历问诊」「帮我挑挑简历的毛病」「HR 会怎么看我的简历」
 22. weakness_analysis —— 跨错题/题库/面试记录分析用户的薄弱模式。args: {{}}
     例：「分析我的薄弱点」「我的面试薄弱模式」「错题规律分析」「我最近老挂在什么地方」
-23. chat —— 以上都不匹配的闲聊/通用问答。args: {{"text":"用户原文"}}
+23. conv_manage —— 多对话管理（类似 ChatGPT 的新建/切换对话）。args: {{"action":"new|list|switch|delete","name":"对话名或序号或null"}}
+    例：「新建对话 求职准备」→ action=new,name=求职准备；「对话列表」「我有哪些对话」→ action=list；
+    「切换到第2个对话」「切换到求职准备」→ action=switch；「删掉第3个对话」→ action=delete
+24. chat —— 以上都不匹配的闲聊/通用问答。args: {{"text":"用户原文"}}
 
 注意：只输出 JSON；拿不准意图时选 chat；时间一律基于当前时间推算为具体时刻。
 分类对象是对话中最后一条用户消息，之前的消息只是帮助理解指代的上下文。"""
@@ -108,8 +120,9 @@ BARE_COMMANDS = {
     "新增一个待办": ("todo_create", {"task": "", "remind_at": None}),
     "个人画像": ("profile_query", {}),
     "看看我的画像": ("profile_query", {}),
-    "新建对话": ("reset_context", {}),
-    "清空上下文": ("reset_context", {}),
+    "新建对话": ("conv_manage", {"action": "new"}),
+    "清空上下文": ("conv_manage", {"action": "new"}),
+    "对话列表": ("conv_manage", {"action": "list"}),
     "岗位发现与匹配": ("jd_match", {"jd": ""}),
     "搜集的全网面经": ("quiz_add", {"questions": ""}),
     "面试准备": ("job_prep", {}),
@@ -125,16 +138,17 @@ class Router:
         self.bot = bot
         self.todo = TodoModule(cfg, db, llm)
         paper_sync = BitableSync(cfg, app_token=cfg.paper_bitable_token)
-        self.paper = PaperModule(cfg, db, llm, paper_sync)
+        self.paper = PaperModule(cfg, db, llm, paper_sync, bot=self.bot)
         bitable = BitableSync(cfg)
         wiki = WikiKB(cfg, db)
-        self.interview = InterviewModule(cfg, db, llm, bitable)
+        self.interview = InterviewModule(cfg, db, llm, bitable, bot=self.bot)
         self.quiz = QuizModule(cfg, db, llm, bitable, wiki)
         self.profile = ProfileModule(cfg, db, llm)
-        self.jobmatch = JobMatchModule(cfg, db, llm)
+        self.jobmatch = JobMatchModule(cfg, db, llm, bot=self.bot)
         self.sessions = {}   # user_id -> 阻塞式会话
         self.contexts = {}   # user_id -> 被动上下文
-        self.histories = {}  # user_id -> 滚动对话历史
+        self.histories = {}  # user_id -> 当前对话的滚动历史（内存缓存，db 持久化）
+        self._conv_active = {}  # user_id -> 当前对话 id（缓存，权威在 kv_store）
         self._lock = threading.Lock()
 
     # ---------- 入口（bot 回调） ----------
@@ -145,14 +159,17 @@ class Router:
             return
         try:
             if msg_type == "file":
+                logger.info("路由 u..%s 收到文件：%s", user_id[-6:], content.get("file_name"))
                 self.bot.reply(message_id, "收到文件（%s），正在解析分析，内容多的话可能要一两分钟，好了马上发你。"
                                % (content.get("file_name") or ""))
                 reply = self._handle_file(user_id, message_id, content)
                 self._record(user_id, "[PDF文件] %s" % (content.get("file_name") or ""), reply)
             elif msg_type == "text":
+                self._ctx(user_id)["current_message_id"] = message_id  # 供流式回复定位
                 reply = self._handle_text(user_id, content.get("text", ""))
                 self._record(user_id, content.get("text", ""), reply)
             elif msg_type == "image":
+                logger.info("路由 u..%s 收到图片", user_id[-6:])
                 self.bot.reply(message_id, "收到图片，正在识别图中内容（面经/JD/简历截图都可以直接发）…")
                 reply = self._handle_image(user_id, message_id, content)
                 self._record(user_id, "[图片]", reply)
@@ -162,7 +179,8 @@ class Router:
             reply = "大模型调用出了点问题：%s\n请稍后再试，或检查 config.yaml 里的 llm 配置。" % e
         except Exception as e:
             reply = "处理时出错了：%s" % e
-        self.bot.reply(message_id, reply)
+        if reply:  # 流式回复已自行定稿时会返回 None，跳过普通回复
+            self.bot.reply(message_id, reply)
 
     # ---------- 文本消息 ----------
     def _handle_text(self, user_id, text, note=None):
@@ -173,6 +191,8 @@ class Router:
         session = self._session(user_id)
 
         # 阻塞式会话（模拟面试/题库考试）优先
+        if session and session.get("module") in ("interview_mock", "quiz"):
+            logger.info("路由 u..%s [%s] → 续聊(%s)", user_id[-6:], _brief(text), session["module"])
         if session and session.get("module") == "interview_mock":
             if "结束面试" in text or text in ("结束", "结束吧"):
                 self._clear_session(user_id)
@@ -199,14 +219,23 @@ class Router:
             intent_data = self._classify(user_id, cls_input)
             intent = intent_data.get("intent", "chat")
             args = intent_data.get("args") or {}
+        logger.info("路由 u..%s [%s] → intent=%s args=%s（%s）",
+                    user_id[-6:], _brief(text), intent, _brief(str(args), 100),
+                    "裸指令" if bare else "LLM")
 
-        if intent == "reset_context":
-            self._clear_session(user_id)
-            with self._lock:
-                self.contexts.pop(user_id, None)
-                self.histories.pop(user_id, None)
-            return ("已开启新对话：对话历史、指代点（上次搜索/简历/JD）、"
-                    "进行中的会话都已清空。我们从这里重新开始。")
+        if intent == "reset_context":  # 兼容旧指令，等同新建对话
+            return self._conv_new(user_id, "")
+        if intent == "conv_manage":
+            action = (args.get("action") or "").strip()
+            if action == "new":
+                return self._conv_new(user_id, args.get("name") or "")
+            if action == "list":
+                return self._conv_list(user_id)
+            if action == "switch":
+                return self._conv_switch(user_id, args.get("name") or "")
+            if action == "delete":
+                return self._conv_delete(user_id, args.get("name") or "")
+            return self._conv_list(user_id)
         if intent == "todo_create":
             return self.todo.handle_create(user_id, args)
         if intent == "todo_manage":
@@ -293,6 +322,7 @@ class Router:
         if len(text) < 5:
             return ("这张图里没识别出有效文字。面经/JD/简历截图可以发清晰一点的图，"
                     "或直接把文字粘贴给我。")
+        logger.info("图片转录 u..%s [%s]", user_id[-6:], _brief(text, 100))
         # 转录文本走正常意图管线：面经截图 → 自动入库分析，JD 截图 → 岗位匹配等
         return self._handle_text(user_id, text,
                                  note="这段文字是用户发送图片的转录内容；若内容是面试题/面经截图，应归 quiz_add（题库/面经），不是用户自己的错题")
@@ -369,17 +399,122 @@ class Router:
         messages.append({"role": "user", "content": text})
         return self.llm.chat(messages)
 
-    # ---------- 滚动历史 ----------
+    # ---------- 定时推送登记 ----------
+    def note_digest_push(self, user_id, text, papers):
+        """论文日报推送后登记：写入对话历史 + 设置指代点，供「总结第N篇」「汇报第N篇」追问。"""
+        self._record(user_id, "[系统推送·论文日报]", text)
+        if papers:
+            self._ctx(user_id)["last_papers"] = papers
+
+    # ---------- 滚动历史（内存缓存 + SQLite 持久化，多对话） ----------
+    def _active_conv(self, user_id):
+        """当前对话 id；没有则恢复上次活跃对话，再没有就惰性创建「默认对话」。"""
+        with self._lock:
+            cid = self._conv_active.get(user_id)
+        if cid:
+            return cid
+        saved = self.db.kv_get("conv_active_" + user_id)
+        if saved:
+            cid = int(saved)
+        else:
+            rows = self.db.list_conversations(user_id)
+            cid = rows[-1]["id"] if rows else self.db.create_conversation(user_id, "默认对话")
+            self.db.kv_set("conv_active_" + user_id, str(cid))
+        with self._lock:
+            self._conv_active[user_id] = cid
+        return cid
+
     def _history(self, user_id):
         with self._lock:
-            return self.histories.setdefault(user_id, [])
+            hist = self.histories.setdefault(user_id, [])
+            need_load = not hist
+        if need_load:
+            rows = self.db.get_conv_messages(self._active_conv(user_id), HISTORY_MAX_PAIRS * 2)
+            with self._lock:
+                hist = self.histories.setdefault(user_id, [])
+                if not hist:  # 双重检查，防并发重复加载
+                    hist.extend({"role": r["role"], "content": r["content"]} for r in rows)
+        return hist
 
     def _record(self, user_id, user_text, reply):
         hist = self._history(user_id)
-        hist.append({"role": "user", "content": (user_text or "")[:HISTORY_MSG_CHARS]})
-        hist.append({"role": "assistant", "content": (reply or "")[:HISTORY_MSG_CHARS]})
+        u, a = (user_text or "")[:HISTORY_MSG_CHARS], (reply or "")[:HISTORY_MSG_CHARS]
+        hist.append({"role": "user", "content": u})
+        hist.append({"role": "assistant", "content": a})
         if len(hist) > HISTORY_MAX_PAIRS * 2:
             del hist[:-HISTORY_MAX_PAIRS * 2]
+        cid = self._active_conv(user_id)
+        self.db.add_conv_message(cid, "user", u)
+        self.db.add_conv_message(cid, "assistant", a)
+
+    # ---------- 多对话管理 ----------
+    def _conv_new(self, user_id, name):
+        self._clear_session(user_id)
+        with self._lock:
+            self.contexts.pop(user_id, None)
+            self.histories.pop(user_id, None)
+            self._conv_active.pop(user_id, None)
+        name = (name or "").strip() or "对话 %d" % (len(self.db.list_conversations(user_id)) + 1)
+        cid = self.db.create_conversation(user_id, name)
+        self.db.kv_set("conv_active_" + user_id, str(cid))
+        return ("已开启新对话「%s」：之前的对话已存档，历史、指代点、进行中的会话已清空。\n"
+                "回复「对话列表」可查看全部对话并随时切换回去。" % name)
+
+    def _conv_list(self, user_id):
+        rows = self.db.list_conversations(user_id)
+        if not rows:
+            return "你还没有任何对话存档，随便聊点什么就会自动建立。"
+        active = self._active_conv(user_id)
+        lines = ["你的对话列表："]
+        for i, r in enumerate(rows, 1):
+            mark = " ← 当前" if r["id"] == active else ""
+            lines.append("%d. %s（%s，%d 条消息）%s" % (
+                i, r["name"], r["created_at"][:10], r["msg_count"], mark))
+        lines.append("\n回复「切换到第N个」/「切换到 名字」继续旧对话；「删掉第N个」删除。")
+        return "\n".join(lines)
+
+    def _resolve_conv(self, user_id, name):
+        rows = self.db.list_conversations(user_id)
+        name = (name or "").strip()
+        import re as _re
+        m = _re.search(r"(\d+)", name)
+        if m:
+            i = int(m.group(1)) - 1
+            if 0 <= i < len(rows):
+                return rows[i]
+        for r in rows:
+            if name and (name in r["name"] or r["name"] in name):
+                return r
+        return None
+
+    def _conv_switch(self, user_id, name):
+        target = self._resolve_conv(user_id, name)
+        if not target:
+            return "没找到这个对话。回复「对话列表」看看你都有哪些。"
+        self._clear_session(user_id)
+        with self._lock:
+            self.contexts.pop(user_id, None)
+            self.histories.pop(user_id, None)
+            self._conv_active[user_id] = target["id"]
+        self.db.kv_set("conv_active_" + user_id, str(target["id"]))
+        self._history(user_id)  # 预加载历史
+        return ("已切换到对话「%s」（%d 条消息）。\n"
+                "该对话的聊天历史已恢复，可以继续聊；指代点和进行中的会话不跨对话保留。"
+                % (target["name"], target["msg_count"]))
+
+    def _conv_delete(self, user_id, name):
+        target = self._resolve_conv(user_id, name)
+        if not target:
+            return "没找到这个对话。回复「对话列表」看看你都有哪些。"
+        self.db.delete_conversation(target["id"], user_id)
+        if self._active_conv(user_id) == target["id"]:
+            with self._lock:
+                self.histories.pop(user_id, None)
+                self._conv_active.pop(user_id, None)
+            self.db.kv_set("conv_active_" + user_id, "")
+            self._active_conv(user_id)  # 重建/切到最近一个
+            return "已删除对话「%s」，当前对话已切换到最近一个。" % target["name"]
+        return "已删除对话「%s」。" % target["name"]
 
     # ---------- 状态管理 ----------
     def _session(self, user_id):

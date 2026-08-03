@@ -181,11 +181,12 @@ def download_arxiv_pdf(entry_id, save_dir=PDF_DIR):
 
 
 class PaperModule:
-    def __init__(self, cfg, db, llm, bitable=None):
+    def __init__(self, cfg, db, llm, bitable=None, bot=None):
         self.cfg = cfg
         self.db = db
         self.llm = llm
         self.bitable = bitable
+        self.bot = bot  # 传入时，长生成（文献汇报）走流式回复
 
     def _save_paper(self, user_id, title, source, url, summary, tags):
         """入库：本地 SQLite（主存储）+ 多维表格「文献库记录」（索引）。"""
@@ -376,19 +377,19 @@ class PaperModule:
             if not pdf_path:
                 return self._report_from_abstract(user_id, paper)
             return self._report_from_pdf(user_id, pdf_path, paper["title"],
-                                         paper["source"], paper["url"])
+                                         paper["source"], paper["url"], ctx)
         # 无序号：按标题 > 刚上传的 PDF
         title = (args.get("title") or "").strip()
         if title:
-            return self._report_by_title(user_id, title)
+            return self._report_by_title(user_id, title, ctx)
         pdf_path = ctx.get("last_pdf_path")
         if not pdf_path or not os.path.exists(pdf_path):
             return ("先给我一篇论文：发 PDF 文件、直接告诉我论文标题（arXiv 上的），"
                     "或搜索后回复「汇报第1篇」。")
         return self._report_from_pdf(user_id, pdf_path, os.path.basename(pdf_path),
-                                     "pdf_upload", "")
+                                     "pdf_upload", "", ctx)
 
-    def _report_by_title(self, user_id, title):
+    def _report_by_title(self, user_id, title, ctx=None):
         """按标题出汇报：先查文献库（有汇报直接复用），再按库存/搜索到的 arXiv 链接下全文。"""
         rows = self.db.search_papers(user_id, title[:50])
         row = rows[0] if rows else None
@@ -409,24 +410,35 @@ class PaperModule:
         if not pdf_path:
             return self._report_from_abstract(user_id, paper)
         return self._report_from_pdf(user_id, pdf_path, paper["title"],
-                                     paper.get("source") or "arxiv", paper["url"])
+                                     paper.get("source") or "arxiv", paper["url"], ctx)
 
-    def _report_from_pdf(self, user_id, pdf_path, title, source, url):
+    def _report_from_pdf(self, user_id, pdf_path, title, source, url, ctx=None):
         try:
             text, truncated = extract_pdf_text(pdf_path)
         except Exception:
             return "PDF 解析失败了，换个文件试试。"
         if len(text.strip()) < 500:
             return "这个 PDF 提取不出足够正文，无法做文献汇报（可能是扫描件）。"
-        report = self.llm.chat([
-            {"role": "system", "content": REPORT_PROMPT},
-            {"role": "user", "content": "论文标题：%s\n正文%s：\n%s" % (
-                title, "（内容有截断）" if truncated else "", text)},
-        ])
+        from ..bot import make_stream
+        stream = make_stream(self.bot, ctx)
+        try:
+            report = self.llm.chat([
+                {"role": "system", "content": REPORT_PROMPT},
+                {"role": "user", "content": "论文标题：%s\n正文%s：\n%s" % (
+                    title, "（内容有截断）" if truncated else "", text)},
+            ], on_delta=stream.update if stream else None)
+        except Exception as e:
+            if stream:
+                stream.close("（生成中断：%s，请稍后再试）" % e)
+            raise
         tags = self._extract_tags(title + " " + text[:1000])
         self._save_paper(user_id, title, source, url, report, tags)
-        return "《%s》文献汇报：\n\n%s\n\n（已存入文献库，标签：%s；之后可在文献库中问答回顾）" % (
+        final = "《%s》文献汇报：\n\n%s\n\n（已存入文献库，标签：%s；之后可在文献库中问答回顾）" % (
             title, report, tags or "无")
+        if stream:
+            stream.close(final)
+            return None  # 已通过流式回复定稿，router 跳过重复回复
+        return final
 
     def _report_from_abstract(self, user_id, paper):
         """拿不到全文时（如 Semantic Scholar 来源或下载失败），基于摘要出汇报并说明。"""
@@ -518,16 +530,22 @@ class PaperModule:
             top_n = int(top_n) if top_n else None
         except (TypeError, ValueError):
             top_n = None
+        old = self.db.get_subscription(user_id)
         self.db.set_subscription(user_id, keywords, enabled=True,
                                  digest_time=digest_time, top_n=top_n)
         show_time = digest_time or self.cfg.paper_digest
         show_n = top_n or self.cfg.paper_digest_top_n
-        return ("已订阅「%s」。\n每天 %s 从 arXiv 新论文中按你的需求筛选 %d 篇推送（附推荐理由）。\n"
-                "回复「取消论文订阅」可关闭；想改方向/时间/篇数直接说。" % (keywords, show_time, show_n))
+        note = ""
+        if old and old["keywords"] and old["keywords"] != keywords:
+            note = "\n（已替换原订阅「%s」；想换回来直接说）" % old["keywords"]
+        return ("已订阅「%s」。\n每天 %s 从 arXiv 新论文中按你的需求筛选 %d 篇推送（附推荐理由）。%s\n"
+                "回复「取消论文订阅」可关闭；想改方向/时间/篇数直接说。" % (keywords, show_time, show_n, note))
 
     def daily_digest(self, user_id, need, top_n):
-        """定时任务调用：按用户需求筛选最近 2 天新论文并生成推送文本；无新论文返回 None。"""
-        since = datetime.now() - timedelta(days=2)
+        """定时任务调用：按用户需求筛选新论文；返回 (推送文本 or None, 入选论文列表)。
+        周一回看 3 天（arXiv 周末不更新，2 天窗口会漏掉周五的新论文）。"""
+        days = 3 if datetime.now().weekday() == 0 else 2
+        since = (datetime.now() - timedelta(days=days)).date()  # 按日期比较，不带时刻
         queries = self._expand_queries(need, user_id)
         seen, candidates = set(), []
         for q in queries:
@@ -536,17 +554,17 @@ class PaperModule:
                 if key in seen:
                     continue
                 try:
-                    pub = datetime.strptime(p["published"], "%Y-%m-%d")
+                    pub = datetime.strptime(p["published"], "%Y-%m-%d").date()
                 except ValueError:
                     continue
                 if pub >= since:
                     seen.add(key)
                     candidates.append(p)
         if not candidates:
-            return None
+            return None, []
         pool = self._hard_filter(user_id, candidates, queries, top_n)
         if not pool:
-            return None
+            return None, []
         picked = self._rerank(need, pool, top_n, user_id)
         lines = ["【论文日报】与你的方向「%s」最相关的新论文：\n" % need]
         for i, (p, reason) in enumerate(picked, 1):
@@ -554,5 +572,5 @@ class PaperModule:
             if reason:
                 lines.append("   推荐理由：%s" % reason)
             lines.append("   %s" % p["url"])
-        lines.append("\n对哪篇感兴趣，可以把标题发给我深入检索，或直接把 PDF 发给我精读。")
-        return "\n".join(lines)
+        lines.append("\n回复「总结第N篇」快速解读，「汇报第N篇」全文精读；也可以把 PDF 直接发给我。")
+        return "\n".join(lines), [p for p, _ in picked]

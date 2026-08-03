@@ -25,11 +25,12 @@ def main():
 
     db = Database(DB_PATH)
     llm = LLMClient(cfg)
-    bot = FeishuBot(cfg)
+    bot = FeishuBot(cfg, db)
     router = Router(cfg, db, llm, bot)
     bot.on_message(router.handle_message)
+    bot.replay_pending()  # 重放重启前未处理完的入站事件
 
-    scheduler = AssistantScheduler(cfg, db, bot, llm)
+    scheduler = AssistantScheduler(cfg, db, bot, llm, router)
     scheduler.start()
 
     if not cfg.llm_configured:

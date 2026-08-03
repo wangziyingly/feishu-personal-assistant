@@ -1,11 +1,13 @@
-"""飞书长连接机器人层：收发消息、下载文件、主动推送。
+"""飞书长连接机器人层：收发消息、下载文件、主动推送、流式回复、入站事件持久化。
 
 只依赖 lark-oapi 官方 SDK 的稳定用法；真实收发需要 config.yaml 里的 app_id/app_secret。
+入站事件先落库（db.inbox_events）再处理，重启/崩溃后重放，重复事件按 message_id 去重。
 """
 import json
 import os
 import re
 import threading
+import time
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
@@ -13,6 +15,8 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequestBody,
     GetMessageResourceRequest,
     P2ImMessageReceiveV1,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
@@ -42,8 +46,9 @@ def _split_text(text, size=MAX_CHUNK):
 
 
 class FeishuBot:
-    def __init__(self, cfg):
+    def __init__(self, cfg, db=None):
         self.cfg = cfg
+        self.db = db  # 入站事件持久化用；不传则退化为内存去重
         self.client = (
             lark.Client.builder()
             .app_id(cfg.feishu_app_id)
@@ -52,7 +57,7 @@ class FeishuBot:
             .build()
         )
         self._handler = None          # 由 router 注入：fn(user_id, chat_id, message_id, msg_type, content)
-        self._seen_ids = set()        # 事件去重（飞书可能重投）
+        self._seen_ids = set()        # 事件去重（无 db 时的内存兜底）
         self._seen_lock = threading.Lock()
         self._ws_client = None
 
@@ -66,13 +71,6 @@ class FeishuBot:
             event = data.event
             msg = event.message
             message_id = msg.message_id
-
-            with self._seen_lock:
-                if message_id in self._seen_ids:
-                    return
-                self._seen_ids.add(message_id)
-                if len(self._seen_ids) > 5000:
-                    self._seen_ids = set(list(self._seen_ids)[-2500:])
 
             chat_type = msg.chat_type  # p2p / group
             mentions = msg.mentions or []
@@ -95,24 +93,65 @@ class FeishuBot:
                 if not content["text"]:
                     return
 
+            # 先落库再处理：重启/崩溃后可在 replay_pending 中恢复；重复事件（飞书重投）去重
+            if self.db:
+                payload = {"user_id": user_id, "chat_id": chat_id, "message_id": message_id,
+                           "msg_type": msg_type, "content": content}
+                if not self.db.inbox_enqueue(message_id, payload):
+                    return
+                # 取刚插入那行的 id（payload 里没带，用 message_id 查）
+                row = self.db._query("SELECT id FROM inbox_events WHERE message_id=?", (message_id,))
+                event_id = row[0]["id"] if row else None
+            else:
+                with self._seen_lock:
+                    if message_id in self._seen_ids:
+                        return
+                    self._seen_ids.add(message_id)
+                event_id = None
+
             if self._handler:
                 threading.Thread(
-                    target=self._safe_handle,
-                    args=(user_id, chat_id, message_id, msg_type, content),
+                    target=self._process_event,
+                    args=(event_id, user_id, chat_id, message_id, msg_type, content),
                     daemon=True,
                 ).start()
         except Exception as e:
             lark.logger.exception("处理消息事件出错: %s", e)
 
-    def _safe_handle(self, user_id, chat_id, message_id, msg_type, content):
+    def _process_event(self, event_id, user_id, chat_id, message_id, msg_type, content):
         try:
             self._handler(user_id, chat_id, message_id, msg_type, content)
+            if self.db and event_id:
+                self.db.inbox_mark(event_id, "done")
         except Exception as e:
             lark.logger.exception("消息处理异常: %s", e)
+            if self.db and event_id:
+                self.db.inbox_mark(event_id, "failed")
             try:
                 self.reply(message_id, "抱歉，处理这条消息时出错了：%s" % e)
             except Exception:
                 pass
+
+    # ---------- 重启重放 ----------
+    def replay_pending(self):
+        """重放入站队列中未完成的事件（重启/睡眠恢复后调用）。"""
+        if not self.db or not self._handler:
+            return 0
+        rows = self.db.inbox_pending()
+        if rows:
+            lark.logger.info("重放 %d 条未处理的入站事件", len(rows))
+        for row in rows:
+            try:
+                p = json.loads(row["payload"])
+                threading.Thread(
+                    target=self._process_event,
+                    args=(row["id"], p["user_id"], p["chat_id"], p["message_id"],
+                          p["msg_type"], p["content"]),
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                lark.logger.error("重放事件失败(id=%s): %s", row["id"], e)
+        return len(rows)
 
     # ---------- 发消息 ----------
     def reply(self, message_id, text):
@@ -133,6 +172,42 @@ class FeishuBot:
             if not resp.success():
                 lark.logger.error("回复消息失败: code=%s msg=%s", resp.code, resp.msg)
                 break
+
+    def reply_get_id(self, message_id, text):
+        """回复并返回新消息的 message_id（流式回复占位用）；失败返回 None。"""
+        req = (
+            ReplyMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                ReplyMessageRequestBody.builder()
+                .content(json.dumps({"text": text}, ensure_ascii=False))
+                .msg_type("text")
+                .build()
+            )
+            .build()
+        )
+        resp = self.client.im.v1.message.reply(req)
+        if not resp.success():
+            lark.logger.error("回复消息失败: code=%s msg=%s", resp.code, resp.msg)
+            return None
+        return resp.data.message_id
+
+    def patch_message(self, mid, text):
+        """更新已发送消息的内容（流式回复的渐进刷新）。"""
+        req = (
+            PatchMessageRequest.builder()
+            .message_id(mid)
+            .request_body(
+                PatchMessageRequestBody.builder()
+                .msg_type("text")
+                .content(json.dumps({"text": text}, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = self.client.im.v1.message.patch(req)
+        if not resp.success():
+            lark.logger.error("更新消息失败: code=%s msg=%s", resp.code, resp.msg)
 
     def push(self, chat_id, text):
         """主动向会话推送消息（提醒/早报/订阅推送用）。"""
@@ -209,3 +284,40 @@ class FeishuBot:
             log_level=lark.LogLevel.INFO,
         )
         self._ws_client.start()
+
+
+class StreamReply:
+    """流式回复：先发占位消息，LLM 边生成边 PATCH 刷新，close 定稿。
+
+    用法：stream = StreamReply(bot, message_id)；llm.chat(..., on_delta=stream.update)；
+    最后 stream.close(完整文本)。close 后模块应返回 None，由 router 跳过重复回复。
+    """
+
+    def __init__(self, bot, message_id, placeholder="▍正在生成，请稍候…"):
+        self._bot = bot
+        self._orig_mid = message_id
+        self._last = 0.0
+        self.mid = bot.reply_get_id(message_id, placeholder) if message_id else None
+
+    def update(self, text):
+        if not self.mid:
+            return
+        now = time.time()
+        if now - self._last < 1.5:  # PATCH 节流，避免触发飞书频控
+            return
+        self._last = now
+        self._bot.patch_message(self.mid, text + " ▍")
+
+    def close(self, text):
+        if self.mid:
+            self._bot.patch_message(self.mid, text)
+        elif self._orig_mid:  # 占位发送失败时退化为普通回复
+            self._bot.reply(self._orig_mid, text)
+
+
+def make_stream(bot, ctx):
+    """从 ctx 取当前消息 id 创建流式回复；无 bot/无消息 id 时返回 None（退化为普通回复）。"""
+    if not bot or not ctx:
+        return None
+    mid = ctx.pop("current_message_id", None)
+    return StreamReply(bot, mid) if mid else None

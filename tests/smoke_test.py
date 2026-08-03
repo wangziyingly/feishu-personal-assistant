@@ -39,7 +39,7 @@ class FakeLLM:
     def __init__(self):
         self.seen = []  # 记录每次 chat 收到的 messages，验证历史注入
 
-    def chat(self, messages, temperature=None, max_tokens=None):
+    def chat(self, messages, temperature=None, max_tokens=None, on_delta=None):
         self.seen.append(messages)
         sys_msg = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
         user_msg = messages[-1]["content"] if messages else ""
@@ -118,6 +118,8 @@ class FakeLLM:
                              "title": "Reflexion" if ("这篇" in text and not m) else None}}
         if "论文" in text and ("搜" in text or "找" in text):
             return {"intent": "paper_search", "args": {"query": text}}
+        if "感兴趣" in text:
+            return {"intent": "paper_summarize_index", "args": {"index": 1}}
         if "结束面试" in text or "模拟" in text and "面试" in text:
             if "题库" in text:
                 return {"intent": "interview_mock", "args": {"topic": "题库 Agent"}}
@@ -135,6 +137,11 @@ class FakeLLM:
         if "订阅" in text:
             return {"intent": "paper_subscribe",
                     "args": {"keywords": "智能体", "enable": True, "time": "09:00", "top_n": 5}}
+        if text.startswith("新建对话"):
+            return {"intent": "conv_manage",
+                    "args": {"action": "new", "name": text[4:].strip() or None}}
+        if "切换" in text:
+            return {"intent": "conv_manage", "args": {"action": "switch", "name": "默认对话"}}
         if "记住" in text:
             return {"intent": "profile_update",
                     "args": {"research_direction": "多智能体强化学习"}}
@@ -165,10 +172,18 @@ class FakeBot:
     def __init__(self):
         self.replies = []
         self.pushes = []
+        self.patches = []       # 流式回复的定稿内容
         self.download_path = None
 
     def reply(self, message_id, text):
         self.replies.append(text)
+
+    def reply_get_id(self, message_id, text):
+        self.replies.append(text)
+        return "stream_mid"
+
+    def patch_message(self, mid, text):
+        self.patches.append(text)
 
     def push(self, chat_id, text):
         self.pushes.append((chat_id, text))
@@ -191,7 +206,10 @@ def make_env():
 
 def say(router, bot, user, text):
     bot.replies.clear()
+    bot.patches.clear()
     router.handle_message(user, "chat_1", "mid_%d" % len(bot.replies), "text", {"text": text})
+    if bot.patches:  # 流式回复：定稿在 patches
+        return bot.patches[-1]
     assert bot.replies, "没有回复"
     return bot.replies[-1]
 
@@ -268,6 +286,49 @@ def test_mock_interview_flow():
     mistakes = db.list_mistakes("u1")
     assert "已记入错题本" in r, r
     assert mistakes and mistakes[0]["question"] == "什么是RESTful？", mistakes
+
+
+def test_inbox_queue():
+    import tempfile
+    db = Database(os.path.join(tempfile.mkdtemp(), "q.db"))
+    assert db.inbox_enqueue("m1", {"a": 1})
+    assert not db.inbox_enqueue("m1", {"a": 1}), "重复 message_id 应去重"
+    rows = db.inbox_pending()
+    assert len(rows) == 1 and rows[0]["status"] == "pending"
+    db.inbox_mark(rows[0]["id"], "done")
+    assert not db.inbox_pending(), "done 不再重放"
+    db.inbox_enqueue("m2", {})
+    db.inbox_mark(db.inbox_pending()[0]["id"], "failed")
+    assert len(db.inbox_pending()) == 1, "failed 且 attempts<3 仍应重放"
+    db.close()
+
+
+def test_conversation_manage():
+    cfg, db, bot, router = make_env()
+    say(router, bot, "u1", "你好")
+    r = say(router, bot, "u1", "新建对话 求职准备")
+    assert "求职准备" in r, r
+    r = say(router, bot, "u1", "对话列表")
+    assert "默认对话" in r and "求职准备" in r and "← 当前" in r, r
+    r = say(router, bot, "u1", "切换到默认对话")
+    assert "已切换" in r, r
+    assert any(m["content"] == "你好" for m in router.histories["u1"]), "切换后应恢复历史"
+
+
+def test_digest_followup():
+    cfg, db, bot, router = make_env()
+    # 模拟日报推送后的登记
+    router.note_digest_push("u1", "【论文日报】……", list(FAKE_PAPERS))
+    assert router._ctx("u1")["last_papers"], "日报论文应进指代点"
+    assert any("论文日报" in m["content"] for m in router.histories["u1"]), "推送应入历史"
+    # 追问「我对第一篇比较感兴趣」→ 走摘要级解读
+    orig = paper_mod.search_papers
+    paper_mod.search_papers = lambda q, n: list(FAKE_PAPERS)
+    try:
+        r = say(router, bot, "u1", "我对第一篇比较感兴趣")
+        assert "解读" in r and "已存入你的文献库" in r, r
+    finally:
+        paper_mod.search_papers = orig
 
 
 def test_report_by_title():
@@ -398,7 +459,7 @@ def test_digest_skip_library():
     orig = paper_mod.search_papers
     paper_mod.search_papers = lambda q, n: list(FAKE_PAPERS)
     try:
-        r = router.paper.daily_digest("u1", "多智能体信用分配", 3)
+        r, _ = router.paper.daily_digest("u1", "多智能体信用分配", 3)
         assert r is None, "候选全部已入库时不应推送"
     finally:
         paper_mod.search_papers = orig
@@ -479,8 +540,9 @@ def test_subscribe_with_time():
     from feishu_assistant.scheduler import AssistantScheduler
     from datetime import datetime as dt
     sched = AssistantScheduler(cfg, db, bot, FakeLLM())
+    assert not sched._should_push(sub, dt(2026, 8, 2, 8, 55)), "未到订阅时间不推"
     assert sched._should_push(sub, dt(2026, 8, 2, 9, 5))
-    assert not sched._should_push(sub, dt(2026, 8, 2, 9, 20)), "超过 15 分钟窗口不应推"
+    assert sched._should_push(sub, dt(2026, 8, 2, 11, 30)), "睡过窗口醒来应补推"
     db.mark_pushed("u1", "2026-08-02")
     sub2 = db.get_subscription("u1")
     assert not sched._should_push(sub2, dt(2026, 8, 2, 9, 5)), "当日已推不应重复"
@@ -621,6 +683,9 @@ if __name__ == "__main__":
         ("考试答砸入错题本", test_quiz_bad_goes_to_mistakes),
         ("订阅时间篇数", test_subscribe_with_time),
         ("按标题生成汇报", test_report_by_title),
+        ("多对话管理", test_conversation_manage),
+        ("入站事件队列", test_inbox_queue),
+        ("日报追问链路", test_digest_followup),
         ("定时任务注册", test_scheduler_init),
         ("长消息拆分", test_split_text),
         ("arXiv 联网搜索", test_arxiv_network),
