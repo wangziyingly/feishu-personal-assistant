@@ -195,6 +195,7 @@ class FakeBot:
 
     def patch_message(self, mid, text):
         self.patches.append(text)
+        return True
 
     def push(self, chat_id, text):
         self.pushes.append((chat_id, text))

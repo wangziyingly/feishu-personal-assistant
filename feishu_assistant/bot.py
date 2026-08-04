@@ -45,6 +45,15 @@ def _split_text(text, size=MAX_CHUNK):
     return chunks
 
 
+def _card_json(text):
+    """把纯文本包成飞书卡片 JSON。飞书的 PATCH 更新消息只支持卡片（interactive）消息，
+    流式回复的占位和刷新都必须走卡片。"""
+    return json.dumps({
+        "config": {"wide_screen_mode": True},
+        "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": text}}],
+    }, ensure_ascii=False)
+
+
 class FeishuBot:
     def __init__(self, cfg, db=None):
         self.cfg = cfg
@@ -174,14 +183,15 @@ class FeishuBot:
                 break
 
     def reply_get_id(self, message_id, text):
-        """回复并返回新消息的 message_id（流式回复占位用）；失败返回 None。"""
+        """以卡片形式回复并返回新消息的 message_id（流式回复占位用）；失败返回 None。
+        必须用卡片：纯文本消息不支持 PATCH 更新（飞书限制）。"""
         req = (
             ReplyMessageRequest.builder()
             .message_id(message_id)
             .request_body(
                 ReplyMessageRequestBody.builder()
-                .content(json.dumps({"text": text}, ensure_ascii=False))
-                .msg_type("text")
+                .content(_card_json(text))
+                .msg_type("interactive")
                 .build()
             )
             .build()
@@ -193,21 +203,26 @@ class FeishuBot:
         return resp.data.message_id
 
     def patch_message(self, mid, text):
-        """更新已发送消息的内容（流式回复的渐进刷新）。"""
-        req = (
-            PatchMessageRequest.builder()
-            .message_id(mid)
-            .request_body(
-                PatchMessageRequestBody.builder()
-                .msg_type("text")
-                .content(json.dumps({"text": text}, ensure_ascii=False))
+        """更新已发送卡片消息的内容（流式回复的渐进刷新）。成功返回 True，失败返回 False。"""
+        try:
+            req = (
+                PatchMessageRequest.builder()
+                .message_id(mid)
+                .request_body(
+                    PatchMessageRequestBody.builder()
+                    .content(_card_json(text))
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        resp = self.client.im.v1.message.patch(req)
+            resp = self.client.im.v1.message.patch(req)
+        except Exception as e:
+            lark.logger.error("更新消息异常: %s", e)
+            return False
         if not resp.success():
             lark.logger.error("更新消息失败: code=%s msg=%s", resp.code, resp.msg)
+            return False
+        return True
 
     def push(self, chat_id, text):
         """主动向会话推送消息（提醒/早报/订阅推送用）。"""
@@ -309,9 +324,9 @@ class StreamReply:
         self._bot.patch_message(self.mid, text + " ▍")
 
     def close(self, text):
-        if self.mid:
-            self._bot.patch_message(self.mid, text)
-        elif self._orig_mid:  # 占位发送失败时退化为普通回复
+        if self.mid and self._bot.patch_message(self.mid, text):
+            return
+        if self._orig_mid:  # 占位发送/定稿刷新失败时退化为普通回复，保证内容不丢
             self._bot.reply(self._orig_mid, text)
 
 
