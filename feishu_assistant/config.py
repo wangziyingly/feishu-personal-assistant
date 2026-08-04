@@ -62,6 +62,11 @@ class Config:
         self.wiki_space_id = (wiki.get("space_id") or "").strip()
         self.wiki_parent_node = (wiki.get("parent_node") or "").strip()
 
+        # GitHub 仓库订阅（可选）：token 提高 API 限额（60→5000 次/小时），不配也能用
+        github = self._data.get("github") or {}
+        self.github_token = (github.get("token") or "").strip()
+        self.github_poll_minutes = int(github.get("poll_minutes", 60))
+
     @property
     def feishu_configured(self):
         return bool(self.feishu_app_id and self.feishu_app_secret) and not self.feishu_app_id.startswith("cli_xxx")

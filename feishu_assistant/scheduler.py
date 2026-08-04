@@ -10,6 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from .modules.todo import TodoModule
 from .modules.paper import PaperModule
+from .modules.ghwatch import GhWatchModule
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class AssistantScheduler:
         self.router = router  # 可选：日报推送后登记指代点/历史，供用户追问
         self.todo = TodoModule(cfg, db, llm)
         self.paper = PaperModule(cfg, db, llm)
+        self.ghwatch = GhWatchModule(cfg, db, llm)
         self._sched = BackgroundScheduler()
 
         # 每分钟检查到点待办
@@ -40,6 +42,9 @@ class AssistantScheduler:
                             id="morning_brief", misfire_grace_time=8 * 3600, coalesce=True)
         # 每日论文订阅推送：每 15 分钟扫一次，按每个订阅自己的时间推送（防当日重复）
         self._sched.add_job(self._job_paper_digest, "interval", minutes=15, id="paper_digest")
+        # GitHub release 雷达：按配置的间隔轮询（默认每小时）
+        self._sched.add_job(self._job_github_watch, "interval",
+                            minutes=cfg.github_poll_minutes, id="github_watch")
 
     def start(self):
         self._sched.start()
@@ -94,15 +99,53 @@ class AssistantScheduler:
                     continue
                 try:
                     top_n = sub["top_n"] or self.cfg.paper_digest_top_n
-                    text, papers = self.paper.daily_digest(sub["user_id"], sub["keywords"], top_n)
+                    text, papers, searched_ok = self.paper.daily_digest(
+                        sub["user_id"], sub["keywords"], top_n)
                     if text:
                         self.bot.push(chat_id, text)
                         if self.router:
                             self.router.note_digest_push(sub["user_id"], text, papers)
-                    # 空结果（当天无新论文）也标记，避免每 15 分钟白跑一轮；
-                    # 异常走 except 不标记，下轮会重试
-                    self.db.mark_pushed(sub["user_id"], now.strftime("%Y-%m-%d"))
+                    # 检索成功（含干净的空结果）才标记；检索失败（限流等）不标记，下轮重试
+                    if searched_ok:
+                        self.db.mark_pushed(sub["user_id"], now.strftime("%Y-%m-%d"))
+                    else:
+                        logger.warning("论文日报检索失败（可能限流），下轮重试(user=%s)", sub["user_id"])
                 except Exception as e:
                     logger.error("推送论文日报失败(user=%s): %s", sub["user_id"], e)
         except Exception as e:
             logger.error("论文日报任务失败: %s", e)
+
+    # ---------- GitHub release 雷达 ----------
+    def _job_github_watch(self):
+        try:
+            # 按用户归组：同一轮多个 repo 出新版本时，一次 LLM 调用批量解读（漏斗第 1 层）
+            by_user = {}
+            for w in self.db.all_github_watches():
+                by_user.setdefault(w["user_id"], []).append(w)
+            for user_id, watches in by_user.items():
+                chat_id = self.db.get_chat_id(user_id)
+                if not chat_id:
+                    continue
+                pending = []  # [(watch, release)]
+                for w in watches:
+                    new = self.ghwatch.check_new_releases(w)
+                    if new is None:  # 拉取失败（限流/断网）：游标不动，下轮重试
+                        continue
+                    if not w["last_release_id"] and not new:
+                        # 游标未初始化（订阅时拉取失败）：本轮补上，避免误推历史版本
+                        self.db.mark_github_release(
+                            w["id"], self.ghwatch.latest_release_id(w["repo"]))
+                    pending.extend((w, r) for r in new)
+                if not pending:
+                    continue
+                text = self.ghwatch.digest_text(user_id, [(w["repo"], r) for w, r in pending])
+                if not text:  # LLM 解读失败：游标不动，下轮重试
+                    continue
+                try:
+                    self.bot.push(chat_id, text)
+                    for w, r in pending:
+                        self.db.mark_github_release(w["id"], r["id"])
+                except Exception as e:
+                    logger.error("推送 GitHub release 失败(user=%s): %s", user_id, e)
+        except Exception as e:
+            logger.error("GitHub 订阅任务失败: %s", e)

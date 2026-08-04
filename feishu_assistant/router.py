@@ -20,6 +20,7 @@ from .modules.paper import PaperModule
 from .modules.profile import ProfileModule
 from .modules.quiz import QuizModule
 from .modules.todo import TodoModule
+from .modules.ghwatch import GhWatchModule
 
 HISTORY_MAX_PAIRS = 10     # 滚动历史保留轮数（超出丢弃最旧的）
 HISTORY_MSG_CHARS = 500    # 每条消息存入历史的截断长度（控制 token）
@@ -94,6 +95,11 @@ INTENT_PROMPT = """你是飞书个人助手的意图分类器。当前时间：{
     例：「新建对话 求职准备」→ action=new,name=求职准备；「对话列表」「我有哪些对话」→ action=list；
     「切换到第2个对话」「切换到求职准备」→ action=switch；「删掉第3个对话」→ action=delete
 24. chat —— 以上都不匹配的闲聊/通用问答。args: {{"text":"用户原文"}}
+25. github_watch —— GitHub 仓库订阅：盯 repo 的新 release 并推送解读。args: {{"action":"add|remove|list","repo":"owner/repo 或 GitHub 链接或null"}}
+    例：「订阅 langchain-ai/langgraph 的更新」「帮我盯着 openai/openai-agents-python 这个仓库」→ action=add,repo=langchain-ai/langgraph
+    例：「https://github.com/geekan/MetaGPT 帮我订阅这个」→ action=add,repo=geekan/MetaGPT
+    例：「我订阅了哪些repo」「GitHub订阅列表」→ action=list；「取消订阅 MetaGPT」「别盯这个仓库了」→ action=remove
+    注意区分：「订阅xx方向的论文」是 intent 7（论文订阅），只有 GitHub 仓库才走本意图
 
 注意：只输出 JSON；拿不准意图时选 chat；时间一律基于当前时间推算为具体时刻。
 分类对象是对话中最后一条用户消息，之前的消息只是帮助理解指代的上下文。"""
@@ -127,6 +133,8 @@ BARE_COMMANDS = {
     "搜集的全网面经": ("quiz_add", {"questions": ""}),
     "面试准备": ("job_prep", {}),
     "复盘与迭代": ("interview_review", {"action": "add", "questions": ""}),
+    "GitHub订阅": ("github_watch", {"action": "list"}),
+    "GitHub仓库订阅": ("github_watch", {"action": "list"}),
 }
 
 
@@ -145,6 +153,7 @@ class Router:
         self.quiz = QuizModule(cfg, db, llm, bitable, wiki)
         self.profile = ProfileModule(cfg, db, llm)
         self.jobmatch = JobMatchModule(cfg, db, llm, bot=self.bot)
+        self.ghwatch = GhWatchModule(cfg, db, llm)
         self.sessions = {}   # user_id -> 阻塞式会话
         self.contexts = {}   # user_id -> 被动上下文
         self.histories = {}  # user_id -> 当前对话的滚动历史（内存缓存，db 持久化）
@@ -283,6 +292,8 @@ class Router:
             return self.jobmatch.clinic(user_id, ctx)
         if intent == "weakness_analysis":
             return self.interview.weakness_analysis(user_id)
+        if intent == "github_watch":
+            return self.ghwatch.handle_watch(user_id, args)
         if intent == "job_prep":
             return ("面试准备区，直接回复对应指令：\n"
                     "· 「定制简历」——针对你发过的 JD 改一版 ATS 友好的简历\n"

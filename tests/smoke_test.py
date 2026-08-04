@@ -56,6 +56,9 @@ class FakeLLM:
             return "面试官：请做一下自我介绍。"
         if "文献汇报" in sys_msg or "组会" in sys_msg:
             return "【一句话总结】测试汇报\n【方法详解】方法细节\n【局限与批判性思考】局限"
+        if "技术雷达助手" in sys_msg:
+            return ("📦 langchain-ai/langgraph v0.2.0\n【更新了什么】新增增量 checkpoint\n"
+                    "【为什么值得关注】与 Agent 开发相关")
         return "好的，我在。"
 
     def chat_vision(self, prompt, image_path):
@@ -132,6 +135,14 @@ class FakeLLM:
             return {"intent": "quiz_query", "args": {}}
         if "面试题" in text and "分析" in text:
             return {"intent": "quiz_add", "args": {"questions": text}}
+        if "github" in text.lower() or "langgraph" in text.lower() or "仓库" in text:
+            if "取消" in text:
+                return {"intent": "github_watch",
+                        "args": {"action": "remove", "repo": "langchain-ai/langgraph"}}
+            if "哪些" in text or "列表" in text:
+                return {"intent": "github_watch", "args": {"action": "list"}}
+            return {"intent": "github_watch",
+                    "args": {"action": "add", "repo": "langchain-ai/langgraph"}}
         if "取消" in text and "订阅" in text:
             return {"intent": "paper_subscribe", "args": {"enable": False}}
         if "订阅" in text:
@@ -459,8 +470,11 @@ def test_digest_skip_library():
     orig = paper_mod.search_papers
     paper_mod.search_papers = lambda q, n: list(FAKE_PAPERS)
     try:
-        r, _ = router.paper.daily_digest("u1", "多智能体信用分配", 3)
-        assert r is None, "候选全部已入库时不应推送"
+        r, _, ok = router.paper.daily_digest("u1", "多智能体信用分配", 3)
+        assert r is None and ok, "候选全部已入库时不推送，但算检索成功"
+        paper_mod.search_papers = lambda q, n: []
+        r2, _, ok2 = router.paper.daily_digest("u2", "xxx", 3)
+        assert r2 is None and not ok2, "检索全空应标记为检索失败"
     finally:
         paper_mod.search_papers = orig
 
@@ -630,7 +644,68 @@ def test_scheduler_init():
     cfg, db, bot, router = make_env()
     sched = AssistantScheduler(cfg, db, bot, FakeLLM())
     job_ids = {j.id for j in sched._sched.get_jobs()}
-    assert {"due_todos", "morning_brief", "paper_digest"} <= job_ids, job_ids
+    assert {"due_todos", "morning_brief", "paper_digest", "github_watch"} <= job_ids, job_ids
+
+
+def test_github_watch_flow():
+    from feishu_assistant.modules import ghwatch as gh_mod
+    # repo 名解析：支持 URL / .git 后缀 / 非法输入
+    assert gh_mod.normalize_repo("https://github.com/langchain-ai/langgraph") == "langchain-ai/langgraph"
+    assert gh_mod.normalize_repo("langchain-ai/langgraph.git") == "langchain-ai/langgraph"
+    assert gh_mod.normalize_repo("随便一句话") is None
+    cfg, db, bot, router = make_env()
+    router.ghwatch._fetch_releases = lambda repo: [
+        {"id": "100", "tag": "v0.1.0", "name": "v0.1.0", "url": "http://gh/1",
+         "body": "首个版本", "draft": False, "prerelease": False}]
+    r = say(router, bot, "u1", "订阅 langchain-ai/langgraph 的更新")
+    assert "已订阅" in r and "langchain-ai/langgraph" in r, r
+    w = db.list_github_watch("u1")[0]
+    assert w["last_release_id"] == "100", "订阅时游标应初始化为当前最新 release"
+    r = say(router, bot, "u1", "订阅 langchain-ai/langgraph 的更新")
+    assert "已经订阅过" in r, r
+    r = say(router, bot, "u1", "GitHub订阅")
+    assert "langchain-ai/langgraph" in r, r
+    r = say(router, bot, "u1", "取消订阅 langchain-ai/langgraph")
+    assert "已取消" in r, r
+    assert not db.list_github_watch("u1")
+
+
+def test_github_release_push():
+    from feishu_assistant.scheduler import AssistantScheduler
+    cfg, db, bot, router = make_env()
+    say(router, bot, "u1", "你好")  # 确保 chat_id 落库，可主动推送
+    db.add_github_watch("u1", "langchain-ai/langgraph")
+    w = db.list_github_watch("u1")[0]
+    db.mark_github_release(w["id"], "100")
+    rels = [
+        {"id": "101", "tag": "v0.2.0", "name": "v0.2.0", "url": "http://gh/2",
+         "body": "新增增量 checkpoint", "draft": False, "prerelease": False},
+        {"id": "100", "tag": "v0.1.0", "name": "v0.1.0", "url": "http://gh/1",
+         "body": "首个版本", "draft": False, "prerelease": False},
+    ]
+    sched = AssistantScheduler(cfg, db, bot, router.llm)
+    sched.ghwatch._fetch_releases = lambda repo: rels
+    bot.pushes.clear()
+    sched._job_github_watch()
+    assert bot.pushes, "有新 release 应推送"
+    text = bot.pushes[-1][1]
+    assert "langgraph" in text and "http://gh/2" in text, text
+    assert db.list_github_watch("u1")[0]["last_release_id"] == "101", "推送后游标应推进"
+    bot.pushes.clear()
+    sched._job_github_watch()
+    assert not bot.pushes, "无新 release 不应重复推送"
+    # prerelease 应被硬过滤，不推
+    rels.insert(0, {"id": "102", "tag": "v0.3.0-rc", "name": "rc", "url": "http://gh/3",
+                    "body": "", "draft": False, "prerelease": True})
+    sched._job_github_watch()
+    assert not bot.pushes, "prerelease 不应推送"
+    # 拉取失败：游标不动（下轮重试），不推
+    def boom(repo):
+        raise RuntimeError("限流")
+    sched.ghwatch._fetch_releases = boom
+    sched._job_github_watch()
+    assert not bot.pushes
+    assert db.list_github_watch("u1")[0]["last_release_id"] == "101"
 
 
 def test_split_text():
@@ -687,6 +762,8 @@ if __name__ == "__main__":
         ("入站事件队列", test_inbox_queue),
         ("日报追问链路", test_digest_followup),
         ("定时任务注册", test_scheduler_init),
+        ("GitHub订阅管理", test_github_watch_flow),
+        ("GitHub release 推送", test_github_release_push),
         ("长消息拆分", test_split_text),
         ("arXiv 联网搜索", test_arxiv_network),
     ]

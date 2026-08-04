@@ -26,16 +26,18 @@ Python + 飞书官方 SDK 长连接（无需公网服务器）+ OpenAI 兼容大
 - 个人画像：记住研究方向/目标公司/简历要点，论文推荐和面试都按"你是谁"来做
 - 多轮上下文：最近 10 轮对话滚动记忆，「新建对话」一键清空
 - 图片理解：面经/JD/简历截图直接发（需要视觉模型，如 kimi-k3）
+- GitHub 雷达：订阅仓库后盯新 release，LLM 中文解读"更新了什么、为什么值得关注"定时推送
 
 ## 架构要点
 
-- **意图路由**：LLM 意图分类（24 类，few-shot 驱动）+ 菜单裸指令硬编码表（确定的不交给模型）；每次路由决策落日志，排查误判直接查账
+- **意图路由**：LLM 意图分类（25 类，few-shot 驱动）+ 菜单裸指令硬编码表（确定的不交给模型）；每次路由决策落日志，排查误判直接查账
 - **成本漏斗**：检索后先做零成本硬过滤（去重/关键词/截断）→ 单次 LLM 批量排序 → 精读前查缓存，先便宜后贵
 - **防虚构**：状态变更确认（已入库/已订阅）只由代码生成，闲聊 prompt 明确禁止声称完成动作
 - **入站事件持久化**：消息先写 SQLite 再处理，重启/崩溃自动重放，飞书重投按 message_id 去重
 - **流式回复**：长生成（文献汇报/简历深挖/定制简历）边生成边刷新消息，不用干等
 - **多对话**：命名会话 + 历史落库，「新建对话/对话列表/切换」可并行多个话题，重启不失忆
 - **本地为主，云端为副本**：SQLite 是主存储；飞书多维表格/知识库是自动同步的索引与归档，同步失败不影响主流程
+- **GitHub release 雷达**：轮询 GitHub REST API（无需公网服务器），release id 游标去重防重复推送，拉取/解读失败游标不动下轮自动重试（at-least-once）
 
 ```
 飞书消息 → 长连接 → 意图路由 → 模块（文献/面试/题库/岗位/待办/画像）
@@ -78,6 +80,7 @@ cp config.example.yaml config.yaml   # 填入 App ID/Secret 和 LLM key
 - `llm`：任意 OpenAI 兼容接口。推荐 kimi-k3（多模态，可理解图片）；base_url / api_key / model 均可换
 - `schedule`：待办早报、论文日报的默认推送时间
 - `bitable` / `wiki`（可选）：多维表格与知识库归档，配置模板见 `config.example.yaml` 注释
+- `github`（可选）：仓库 release 订阅的 API token（不配也能用，限额 60 次/小时）与轮询间隔
 
 ## 常用指令速查
 
@@ -95,6 +98,7 @@ cp config.example.yaml config.yaml   # 填入 App ID/Secret 和 LLM key
 | 错题复盘 | 「今天面试被问到：…」「分析我的薄弱点」 |
 | 待办 | 「明天下午3点提醒我交周报」 |
 | 画像 | 「记住我的研究方向是多智能体」「个人画像」 |
+| GitHub 订阅 | 「订阅 langchain-ai/langgraph 的更新」「我订阅了哪些repo」「取消订阅 MetaGPT」 |
 | 上下文 | 「新建对话」（清空上下文重新开始） |
 
 ## 项目结构
@@ -106,16 +110,16 @@ feishu_assistant/
 ├── router.py        # 意图路由（LLM 分类 + 裸指令表 + 滚动上下文）
 ├── llm.py           # OpenAI 兼容客户端（流式读取，防长生成超时）
 ├── db.py            # SQLite：用户/待办/文献/题库/错题/画像/订阅
-├── scheduler.py     # 定时任务：待办提醒、早报、论文日报
+├── scheduler.py     # 定时任务：待办提醒、早报、论文日报、GitHub release 雷达
 ├── bitable.py       # 飞书多维表格同步（题库/错题本/文献库索引）
 ├── wiki_kb.py       # 飞书知识库归档（面经库按分类分文档，20 题一篇）
-└── modules/         # paper / interview / quiz / jobmatch / profile / todo
+└── modules/         # paper / interview / quiz / jobmatch / profile / todo / ghwatch
 ```
 
 ## 测试
 
 ```bash
-.venv/bin/python tests/smoke_test.py   # 28 项冒烟测试，不依赖真实飞书/LLM
+.venv/bin/python tests/smoke_test.py   # 33 项冒烟测试，不依赖真实飞书/LLM
 ```
 
 ## License

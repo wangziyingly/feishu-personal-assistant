@@ -96,6 +96,14 @@ CREATE TABLE IF NOT EXISTS conv_messages (
     content    TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS github_watch (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT NOT NULL,
+    repo            TEXT NOT NULL,               -- owner/name
+    last_release_id TEXT NOT NULL DEFAULT '',    -- 最近已推送的 release id，去重兼重试游标
+    created_at      TEXT NOT NULL,
+    UNIQUE(user_id, repo)
+);
 CREATE TABLE IF NOT EXISTS inbox_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id TEXT NOT NULL UNIQUE,   -- 飞书消息 id，兼作去重键
@@ -244,6 +252,36 @@ class Database:
 
     def active_subscriptions(self):
         return self._query("SELECT * FROM subscriptions WHERE enabled=1")
+
+    # ---------- GitHub 仓库订阅（release 雷达） ----------
+    def add_github_watch(self, user_id, repo):
+        """订阅 repo；已存在返回 False。"""
+        try:
+            self._execute(
+                "INSERT INTO github_watch(user_id, repo, created_at) VALUES(?,?,?)",
+                (user_id, repo, now_str()),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def remove_github_watch(self, user_id, repo):
+        cur = self._execute(
+            "DELETE FROM github_watch WHERE user_id=? AND repo=?", (user_id, repo))
+        return cur.rowcount > 0
+
+    def list_github_watch(self, user_id):
+        return self._query(
+            "SELECT * FROM github_watch WHERE user_id=? ORDER BY id", (user_id,))
+
+    def all_github_watches(self):
+        return self._query("SELECT * FROM github_watch ORDER BY id")
+
+    def mark_github_release(self, watch_id, release_id):
+        self._execute(
+            "UPDATE github_watch SET last_release_id=? WHERE id=?",
+            (str(release_id), watch_id),
+        )
 
     # ---------- 面试记录 ----------
     def add_interview_session(self, user_id, type_, transcript, feedback=""):
