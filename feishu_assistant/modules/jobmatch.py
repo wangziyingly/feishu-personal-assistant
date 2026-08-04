@@ -172,6 +172,7 @@ class JobMatchModule:
         self.db.add_interview_session(user_id, "prep_resume", {"jd": jd[:1000]}, reply)
         if stream:
             stream.close(reply)
+            ctx["_streamed_text"] = reply
             return None
         return reply
 

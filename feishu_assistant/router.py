@@ -171,17 +171,20 @@ class Router:
                 logger.info("路由 u..%s 收到文件：%s", user_id[-6:], content.get("file_name"))
                 self.bot.reply(message_id, "收到文件（%s），正在解析分析，内容多的话可能要一两分钟，好了马上发你。"
                                % (content.get("file_name") or ""))
+                self._ctx(user_id)["current_message_id"] = message_id  # 供流式回复定位
                 reply = self._handle_file(user_id, message_id, content)
-                self._record(user_id, "[PDF文件] %s" % (content.get("file_name") or ""), reply)
+                self._record(user_id, "[PDF文件] %s" % (content.get("file_name") or ""),
+                             self._final_reply(user_id, reply))
             elif msg_type == "text":
                 self._ctx(user_id)["current_message_id"] = message_id  # 供流式回复定位
                 reply = self._handle_text(user_id, content.get("text", ""))
-                self._record(user_id, content.get("text", ""), reply)
+                self._record(user_id, content.get("text", ""), self._final_reply(user_id, reply))
             elif msg_type == "image":
                 logger.info("路由 u..%s 收到图片", user_id[-6:])
                 self.bot.reply(message_id, "收到图片，正在识别图中内容（面经/JD/简历截图都可以直接发）…")
+                self._ctx(user_id)["current_message_id"] = message_id  # 供流式回复定位
                 reply = self._handle_image(user_id, message_id, content)
-                self._record(user_id, "[图片]", reply)
+                self._record(user_id, "[图片]", self._final_reply(user_id, reply))
             else:
                 reply = "我目前只理解文字、图片和 PDF 文件消息，其他类型（语音等）暂时处理不了。"
         except LLMError as e:
@@ -256,7 +259,7 @@ class Router:
         if intent == "paper_report":
             return self.paper.handle_report(user_id, args, ctx)
         if intent == "paper_library":
-            return self.paper.handle_library(user_id, args, text)
+            return self.paper.handle_library(user_id, args, text, ctx)
         if intent == "paper_subscribe":
             return self.paper.handle_subscribe(user_id, args)
         if intent == "interview_mock":
@@ -291,7 +294,7 @@ class Router:
         if intent == "resume_clinic":
             return self.jobmatch.clinic(user_id, ctx)
         if intent == "weakness_analysis":
-            return self.interview.weakness_analysis(user_id)
+            return self.interview.weakness_analysis(user_id, ctx)
         if intent == "github_watch":
             return self.ghwatch.handle_watch(user_id, args)
         if intent == "job_prep":
@@ -397,6 +400,12 @@ class Router:
             return {"intent": "chat", "args": {"text": text}}
 
     # ---------- 闲聊 ----------
+    def _final_reply(self, user_id, reply):
+        """流式回复返回 None 时，取模块登记的定稿文本，供写入对话历史。"""
+        if reply is not None:
+            return reply
+        return self._ctx(user_id).pop("_streamed_text", None) or ""
+
     def _chat(self, user_id, text):
         # 带完整滚动历史：对输出的改进意见（"太简略了""再改一版"）能看懂在改什么
         messages = [{"role": "system", "content":
@@ -408,7 +417,18 @@ class Router:
             "或如实说明当前缺少前置条件（如需要先发 PDF）。"}]
         messages.extend(self._history(user_id))
         messages.append({"role": "user", "content": text})
-        return self.llm.chat(messages)
+        from .bot import make_stream
+        stream = make_stream(self.bot, self._ctx(user_id))
+        if not stream:
+            return self.llm.chat(messages)
+        try:
+            final = self.llm.chat(messages, on_delta=stream.update)
+        except Exception as e:
+            stream.close("（生成中断：%s，请稍后再试）" % e)
+            raise
+        stream.close(final)
+        self._ctx(user_id)["_streamed_text"] = final
+        return None  # 已通过流式回复定稿，router 跳过重复回复
 
     # ---------- 定时推送登记 ----------
     def note_digest_push(self, user_id, text, papers):

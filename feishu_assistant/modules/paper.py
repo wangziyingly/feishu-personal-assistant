@@ -437,6 +437,8 @@ class PaperModule:
             title, report, tags or "无")
         if stream:
             stream.close(final)
+            if ctx is not None:
+                ctx["_streamed_text"] = final
             return None  # 已通过流式回复定稿，router 跳过重复回复
         return final
 
@@ -494,7 +496,7 @@ class PaperModule:
             return "other"
 
     # ---------- 文献库 ----------
-    def handle_library(self, user_id, args, raw_text):
+    def handle_library(self, user_id, args, raw_text, ctx=None):
         rows = self.db.list_papers(user_id, limit=20)
         if not rows:
             return ("你的文献库还是空的。可以把论文 PDF 直接发给我，"
@@ -512,7 +514,18 @@ class PaperModule:
             {"role": "user", "content":
                 "我的文献库条目：\n%s\n\n我的问题：%s" % ("\n\n".join(entries), query)},
         ]
-        return self.llm.chat(messages)
+        from ..bot import make_stream
+        stream = make_stream(self.bot, ctx)
+        if not stream:
+            return self.llm.chat(messages)
+        try:
+            final = self.llm.chat(messages, on_delta=stream.update)
+        except Exception as e:
+            stream.close("（生成中断：%s，请稍后再试）" % e)
+            raise
+        stream.close(final)
+        ctx["_streamed_text"] = final
+        return None  # 已通过流式回复定稿，router 跳过重复回复
 
     # ---------- 订阅 ----------
     def handle_subscribe(self, user_id, args):

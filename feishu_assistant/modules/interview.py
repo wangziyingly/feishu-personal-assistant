@@ -197,6 +197,7 @@ class InterviewModule:
         reply = result + "\n\n回复「用这份简历模拟面试」，我可以直接扮演面试官开始实战演练。"
         if stream:
             stream.close(reply)
+            ctx["_streamed_text"] = reply
             return None
         return reply
 
@@ -255,7 +256,7 @@ class InterviewModule:
         return "\n".join(lines)
 
     # ---------- 薄弱模式分析（跨错题/题库/面试记录找规律） ----------
-    def weakness_analysis(self, user_id):
+    def weakness_analysis(self, user_id, ctx=None):
         mistakes = self.db.list_mistakes(user_id, limit=50)
         bank = self.db.list_questions(user_id, limit=100)
         sessions = self.db.list_interview_sessions(user_id, limit=5)
@@ -275,11 +276,22 @@ class InterviewModule:
         if sessions:
             parts.append("【近期面试复盘摘要】\n" + "\n".join(
                 "· [%s] %s" % (r["type"], (r["feedback"] or "")[:300]) for r in sessions))
-        reply = self.llm.chat([
-            {"role": "user", "content": WEAKNESS_PROMPT % "\n\n".join(parts)[:8000]},
-        ])
-        reply = "【薄弱模式分析】\n\n" + reply + "\n\n（建议配合：「看看错题本」复习、「考考我」验证提升）"
+        from ..bot import make_stream
+        stream = make_stream(self.bot, ctx)
+        try:
+            result = self.llm.chat([
+                {"role": "user", "content": WEAKNESS_PROMPT % "\n\n".join(parts)[:8000]},
+            ], on_delta=stream.update if stream else None)
+        except Exception as e:
+            if stream:
+                stream.close("（生成中断：%s，请稍后再试）" % e)
+            raise
+        reply = "【薄弱模式分析】\n\n" + result + "\n\n（建议配合：「看看错题本」复习、「考考我」验证提升）"
         self.db.add_interview_session(user_id, "weakness", {}, reply)
+        if stream:
+            stream.close(reply)
+            ctx["_streamed_text"] = reply
+            return None  # 已通过流式回复定稿，router 跳过重复回复
         return reply
 
     # ---------- 历史面试记录 ----------
