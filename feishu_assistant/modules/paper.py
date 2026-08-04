@@ -542,14 +542,20 @@ class PaperModule:
                 "回复「取消论文订阅」可关闭；想改方向/时间/篇数直接说。" % (keywords, show_time, show_n, note))
 
     def daily_digest(self, user_id, need, top_n):
-        """定时任务调用：按用户需求筛选新论文；返回 (推送文本 or None, 入选论文列表)。
+        """定时任务调用：按用户需求筛选新论文。
+        返回 (推送文本 or None, 入选论文列表, 检索是否成功)。
+        检索成功但无新论文 → (None, [], True)，当天不再重试；
+        检索失败（如 API 限流）→ (None, [], False)，下轮应重试。
         周一回看 3 天（arXiv 周末不更新，2 天窗口会漏掉周五的新论文）。"""
         days = 3 if datetime.now().weekday() == 0 else 2
         since = (datetime.now() - timedelta(days=days)).date()  # 按日期比较，不带时刻
         queries = self._expand_queries(need, user_id)
-        seen, candidates = set(), []
+        seen, candidates, any_result = set(), [], False
         for q in queries:
-            for p in search_papers(q, 10):
+            results = search_papers(q, 10)
+            if results:
+                any_result = True
+            for p in results:
                 key = p["url"] or p["title"]
                 if key in seen:
                     continue
@@ -561,10 +567,10 @@ class PaperModule:
                     seen.add(key)
                     candidates.append(p)
         if not candidates:
-            return None, []
+            return None, [], any_result
         pool = self._hard_filter(user_id, candidates, queries, top_n)
         if not pool:
-            return None, []
+            return None, [], True
         picked = self._rerank(need, pool, top_n, user_id)
         lines = ["【论文日报】与你的方向「%s」最相关的新论文：\n" % need]
         for i, (p, reason) in enumerate(picked, 1):
@@ -573,4 +579,4 @@ class PaperModule:
                 lines.append("   推荐理由：%s" % reason)
             lines.append("   %s" % p["url"])
         lines.append("\n回复「总结第N篇」快速解读，「汇报第N篇」全文精读；也可以把 PDF 直接发给我。")
-        return "\n".join(lines), [p for p, _ in picked]
+        return "\n".join(lines), [p for p, _ in picked], True
